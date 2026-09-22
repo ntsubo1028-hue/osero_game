@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QR P2P オセロ</title>
+  
+  <!-- 必要なライブラリ群 -->
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+  <script src="https://unpkg.com/html5-qrcode"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
+
+  <style>
+    :root {
+      --board-color: #2e7d32;
+      --cell-size: min(11vw, 45px); /* 画面幅に合わせてマス目のサイズを自動調整 */
+    }
+    body {
+      font-family: sans-serif;
+      margin: 0; padding: 15px;
+      display: flex; flex-direction: column; align-items: center;
+      background-color: #f5f5f5;
+    }
+    h2, h3 { text-align: center; margin: 10px 0; }
+    button {
+      padding: 12px 24px; font-size: 16px; font-weight: bold; cursor: pointer;
+      margin: 10px; border-radius: 8px; border: none;
+      background-color: #007bff; color: white; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    }
+    button:active { transform: translateY(2px); box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    
+    /* 画面切り替え用 */
+    .screen { display: none; width: 100%; max-width: 500px; flex-direction: column; align-items: center; }
+    .screen.active { display: flex; }
+
+    /* カメラ領域 */
+    #reader { width: 100%; max-width: 350px; margin: 10px 0; }
+
+    /* ゲームUI情報 */
+    #score-board {
+      display: flex; justify-content: space-between; width: 100%;
+      max-width: calc(var(--cell-size) * 8 + 16px);
+      margin-bottom: 10px; font-size: 18px; font-weight: bold;
+    }
+
+    /* ------------------------------
+       オセロ盤と3Dアニメーション
+    ------------------------------ */
+    #board {
+      display: grid;
+      grid-template-columns: repeat(8, var(--cell-size));
+      gap: 2px;
+      background-color: #111; border: 4px solid #111; border-radius: 4px;
+    }
+    .cell {
+      width: var(--cell-size); height: var(--cell-size);
+      background-color: var(--board-color);
+      perspective: 800px; padding: 3px; box-sizing: border-box; cursor: pointer;
+    }
+    .disc {
+      width: 100%; height: 100%;
+      border-radius: 50%; position: relative;
+      transform-style: preserve-3d;
+      transition: transform 0.5s ease-in-out, opacity 0.3s;
+    }
+    .face {
+      position: absolute; width: 100%; height: 100%; border-radius: 50%;
+      backface-visibility: hidden;
+    }
+    .face-black {
+      background-color: #111;
+      box-shadow: inset -2px -2px 4px rgba(255,255,255,0.2), 2px 2px 4px rgba(0,0,0,0.5);
+      transform: rotateY(0deg);
+    }
+    .face-white {
+      background-color: #f9f9f9;
+      box-shadow: inset -2px -2px 4px rgba(0,0,0,0.1), 2px 2px 4px rgba(0,0,0,0.5);
+      transform: rotateY(180deg);
+    }
+    .disc.empty { opacity: 0; transform: scale(0.5); }
+    .disc.black { opacity: 1; transform: rotateY(0deg) scale(1); }
+    .disc.white { opacity: 1; transform: rotateY(180deg) scale(1); }
+  </style>
+</head>
+<body>
+
+  <!-- ==================== セットアップ画面 ==================== -->
+  <div id="setup-screen" class="screen active">
+    <h2>QR P2P オセロ</h2>
+    <div id="role-select">
+      <button onclick="startAsHost()" style="background-color: #d32f2f;">ホスト（黒）になる</button>
+      <button onclick="startAsGuest()" style="background-color: #1976d2;">ゲスト（白）になる</button>
+    </div>
+
+    <!-- ホスト用手順UI -->
+    <div id="host-ui" style="display: none; align-items: center; flex-direction: column;">
+      <h3>手順1: ゲストに読ませる</h3>
+      <canvas id="host-qr"></canvas>
+      <h3>手順2: ゲストの準備ができたら</h3>
+      <button onclick="scanQR(handleGuestAnswer)">ゲストのQRを読む</button>
+    </div>
+
+    <!-- ゲスト用手順UI -->
+    <div id="guest-ui" style="display: none; align-items: center; flex-direction: column;">
+      <h3>手順1: ホストのQRを読む</h3>
+      <button onclick="scanQR(handleHostOffer)">カメラを起動する</button>
+      <div id="guest-qr-area" style="display: none; align-items: center; flex-direction: column;">
+        <h3>手順2: ホストに読ませる</h3>
+        <canvas id="guest-qr"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== カメラ画面 ==================== -->
+  <div id="camera-screen" class="screen">
+    <h3>枠内にQRコードを合わせてください</h3>
+    <div id="reader"></div>
+    <button onclick="cancelScan()" style="background-color: #757575;">キャンセル</button>
+  </div>
+
+  <!-- ==================== ゲーム画面 ==================== -->
+  <div id="game-screen" class="screen">
+    <h2 id="turn-text">通信待機中...</h2>
+    <div id="score-board">
+      <span id="score-black">黒: 2</span>
+      <span id="score-white">白: 2</span>
+    </div>
+    <div id="board"></div>
+  </div>
+
+  <!-- ==================== JavaScript プログラム ==================== -->
+  <script>
+    // --- 1. 定数・変数定義 ---
+    const SCAN_FRAME_RATE = 5; // 将来的なフレームレート調整用の定数
+    const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+    
+    let pc = null;
+    let dataChannel = null;
+    let html5QrCode = null;
+    let isHost = false;
+
+    // ゲームの初期状態
+    let gameState = {
+      turnCount: 1,
+      currentTurn: "host",
+      board: new Array(64).fill(0),
+      message: ""
+    };
+    // 初期配置 (中央の4マス)
+    gameState.board[27] = 2; gameState.board[28] = 1;
+    gameState.board[35] = 1; gameState.board[36] = 2;
+
+    // --- 2. 盤面の初期生成 ---
+    function createBoardDOM() {
+      const boardEl = document.getElementById("board");
+      for (let i = 0; i < 64; i++) {
+        const cell = document.createElement("div");
+        cell.className = "cell";
+        cell.innerHTML = `
+          <div class="disc empty" id="disc-${i}">
+            <div class="face face-black"></div>
+            <div class="face face-white"></div>
+          </div>
+        `;
+        cell.onclick = () => handleCellClick(i);
+        boardEl.appendChild(cell);
+      }
+    }
+    createBoardDOM();
+
+    // --- 3. 画面切り替えユーティリティ ---
+    function showScreen(screenId) {
+      document.querySelectorAll('.screen').forEach(el => el.classList.remove('active'));
+      document.getElementById(screenId).classList.add('active');
+    }
+
+    // --- 4. WebRTC 共通セットアップ処理 ---
+    function setupDataChannel(channel) {
+      dataChannel = channel;
+      dataChannel.onopen = () => {
+        showScreen('game-screen');
+        // ホスト側は通信開通時に最初の盤面データを送って同期させる
+        if (isHost) syncStateToGuest();
+        renderUI();
+      };
+      dataChannel.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+        if (isHost && data.type === "ACTION_PUT_STONE") {
+          processAction(data); // 親機：判定処理へ回す
+        } else if (!isHost && data.type === "STATE_SYNC") {
+          gameState = data.payload; // 子機：状態を上書きして再描画
+          renderUI();
+        }
+      };
+    }
+
+    function waitForIceGathering(peerConnection) {
+      return new Promise((resolve) => {
+        if (peerConnection.iceGatheringState === 'complete') resolve();
+        else peerConnection.onicegatheringstatechange = () => {
+          if (peerConnection.iceGatheringState === 'complete') resolve();
+        };
+      });
+    }
+
+    // --- 5. QRコード関連処理 ---
+    function generateQR(canvasId, sdpObj) {
+      const jsonString = JSON.stringify(sdpObj);
+      const compressed = LZString.compressToBase64(jsonString);
+      QRCode.toCanvas(document.getElementById(canvasId), compressed, { width: 300, errorCorrectionLevel: 'L' });
+    }
+
+    let scanCallback = null;
+    function scanQR(callback) {
+      scanCallback = callback;
+      showScreen('camera-screen');
+      html5QrCode = new Html5Qrcode("reader");
+      html5QrCode.start(
+        { facingMode: "environment" },
+        { fps: SCAN_FRAME_RATE, qrbox: { width: 250, height: 250 } },
+        (decodedText) => {
+          html5QrCode.stop().then(() => {
+            showScreen('setup-screen');
+            try {
+              const decompressed = LZString.decompressFromBase64(decodedText);
+              callback(JSON.parse(decompressed));
+            } catch(e) {
+              alert("QRコードの解析に失敗しました");
+            }
+          });
+        },
+        (errorMessage) => {}
+      );
+    }
+    function cancelScan() {
+      if(html5QrCode) html5QrCode.stop();
+      showScreen('setup-screen');
+    }
+
+    // --- 6. シグナリング（接続確立）フロー ---
+    
+    // 【ホスト】開始処理
+    async function startAsHost() {
+      isHost = true;
+      document.getElementById('role-select').style.display = 'none';
+      document.getElementById('host-ui').style.display = 'flex';
+      
+      pc = new RTCPeerConnection(config);
+      setupDataChannel(pc.createDataChannel('gameChannel'));
+      
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGathering(pc);
+      generateQR('host-qr', pc.localDescription);
+    }
+
+    // 【ゲスト】開始処理
+    function startAsGuest() {
+      isHost = false;
+      document.getElementById('role-select').style.display = 'none';
+      document.getElementById('guest-ui').style.display = 'flex';
+    }
+
+    // 【ゲスト】ホストのQRを読んだ時
+    async function handleHostOffer(offerObj) {
+      pc = new RTCPeerConnection(config);
+      pc.ondatachannel = (event) => setupDataChannel(event.channel);
+      
+      await pc.setRemoteDescription(new RTCSessionDescription(offerObj));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      await waitForIceGathering(pc);
+      
+      document.getElementById('guest-qr-area').style.display = 'flex';
+      generateQR('guest-qr', pc.localDescription);
+    }
+
+    // 【ホスト】ゲストのQRを読んだ時
+    async function handleGuestAnswer(answerObj) {
+      await pc.setRemoteDescription(new RTCSessionDescription(answerObj));
+    }
+
+
+    // --- 7. オセロロジック ---
+
+    function getFlippableDiscs(board, index, playerNum) {
+      if (board[index] !== 0) return [];
+      const opponent = playerNum === 1 ? 2 : 1;
+      const flippableIndices = [];
+      const x = index % 8;
+      const y = Math.floor(index / 8);
+      const directions = [[-1,-1], [0,-1], [1,-1], [-1,0], [1,0], [-1,1], [0,1], [1,1]];
+
+      for (const [dx, dy] of directions) {
+        let cx = x + dx, cy = y + dy;
+        let temp = [];
+        while (cx >= 0 && cx < 8 && cy >= 0 && cy < 8) {
+          let cIndex = cy * 8 + cx;
+          if (board[cIndex] === 0) break;
+          if (board[cIndex] === opponent) temp.push(cIndex);
+          if (board[cIndex] === playerNum) {
+            if (temp.length > 0) flippableIndices.push(...temp);
+            break;
+          }
+          cx += dx; cy += dy;
+        }
+      }
+      return flippableIndices;
+    }
+
+    function hasValidMoves(board, playerNum) {
+      for (let i = 0; i < 64; i++) {
+        if (board[i] === 0 && getFlippableDiscs(board, i, playerNum).length > 0) return true;
+      }
+      return false;
+    }
+
+    // --- 8. 操作と判定処理 ---
+
+    function handleCellClick(index) {
+      const actionData = { type: "ACTION_PUT_STONE", payload: { index, player: isHost ? "host" : "guest" } };
+      if (isHost) processAction(actionData);
+      else dataChannel.send(JSON.stringify(actionData));
+    }
+
+    function syncStateToGuest() {
+      dataChannel.send(JSON.stringify({ type: "STATE_SYNC", payload: gameState }));
+    }
+
+    // 【親機専用】ロジック
+    function processAction(action) {
+      const { index, player } = action.payload;
+      if (gameState.currentTurn !== player) return;
+      
+      const playerNum = player === "host" ? 1 : 2;
+      const flippables = getFlippableDiscs(gameState.board, index, playerNum);
+      if (flippables.length === 0) return;
+
+      // 石を置く＆裏返す
+      gameState.board[index] = playerNum;
+      flippables.forEach(i => gameState.board[i] = playerNum);
+
+      let nextPlayer = player === "host" ? "guest" : "host";
+      let nextPlayerNum = nextPlayer === "host" ? 1 : 2;
+      gameState.message = "";
+
+      // パス判定
+      if (!hasValidMoves(gameState.board, nextPlayerNum)) {
+        if (!hasValidMoves(gameState.board, playerNum)) {
+          gameState.currentTurn = "game_over";
+          gameState.message = "ゲーム終了！";
+        } else {
+          nextPlayer = player;
+          gameState.message = "パスされました！";
+        }
+      }
+
+      if (gameState.currentTurn !== "game_over") {
+        gameState.currentTurn = nextPlayer;
+        gameState.turnCount += 1;
+      }
+
+      syncStateToGuest();
+      renderUI();
+    }
+
+    // --- 9. 画面描画処理 ---
+    function renderUI() {
+      // 1. テキスト更新
+      const turnText = document.getElementById("turn-text");
+      if (gameState.currentTurn === "game_over") {
+        turnText.innerText = gameState.message;
+        turnText.style.color = "#1976d2";
+      } else if (gameState.message) {
+        turnText.innerText = gameState.message;
+        turnText.style.color = "#f57c00";
+      } else {
+        const isMyTurn = gameState.currentTurn === (isHost ? "host" : "guest");
+        turnText.innerText = isMyTurn ? `あなたの番です` : `相手の番です`;
+        turnText.style.color = isMyTurn ? "#d32f2f" : "#757575";
+      }
+
+      // 2. 石数のカウント
+      let blackCount = 0, whiteCount = 0;
+      gameState.board.forEach((val, i) => {
+        if (val === 1) blackCount++;
+        else if (val === 2) whiteCount++;
+        
+        // 3. 盤面のアニメーション更新
+        const disc = document.getElementById(`disc-${i}`);
+        disc.classList.remove("empty", "black", "white");
+        if (val === 0) disc.classList.add("empty");
+        else if (val === 1) disc.classList.add("black");
+        else if (val === 2) disc.classList.add("white");
+      });
+
+      document.getElementById("score-black").innerText = `黒: ${blackCount}`;
+      document.getElementById("score-white").innerText = `白: ${whiteCount}`;
+    }
+  </script>
+</body>
+</html>
