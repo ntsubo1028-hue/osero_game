@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>QR P2P オセロ</title>
   
-  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+  <!-- カメラと文字列圧縮のライブラリ -->
   <script src="https://unpkg.com/html5-qrcode"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/lz-string/1.5.0/lz-string.min.js"></script>
 
@@ -66,6 +66,17 @@
     .disc.empty { opacity: 0; transform: scale(0.5); }
     .disc.black { opacity: 1; transform: rotateY(0deg) scale(1); }
     .disc.white { opacity: 1; transform: rotateY(180deg) scale(1); }
+
+    .loading-text { color: #ff9800; font-weight: bold; margin: 10px 0; }
+    .error-text { color: #d32f2f; font-weight: bold; margin: 10px 0; background: #ffebee; padding: 10px; border-radius: 5px; }
+    
+    /* QRコード表示用画像スタイル（粗めのドットでも綺麗に表示） */
+    .qr-img {
+      width: 280px; height: 280px;
+      border: 4px solid white; box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+      background: white; margin: 10px 0; display: none;
+      image-rendering: pixelated; /* ドットをくっきりさせる */
+    }
   </style>
 </head>
 <body>
@@ -81,8 +92,10 @@
     <!-- ホスト用手順UI -->
     <div id="host-ui" style="display: none; align-items: center; flex-direction: column;">
       <h3>手順1: ゲストに読ませる</h3>
-      <canvas id="host-qr"></canvas>
-      <h3>手順2: ゲストの準備ができたら</h3>
+      <p id="host-status" class="loading-text"></p>
+      <img id="host-qr" class="qr-img" alt="ホスト用QRコード">
+      
+      <h3 style="margin-top: 20px;">手順2: ゲストの準備ができたら</h3>
       <button onclick="scanQR(handleGuestAnswer)">ゲストのQRを読む</button>
       <button onclick="resetSetup()" style="background-color: #757575;">◀ 選択画面に戻る</button>
     </div>
@@ -93,7 +106,8 @@
       <button onclick="scanQR(handleHostOffer)">カメラを起動する</button>
       <div id="guest-qr-area" style="display: none; align-items: center; flex-direction: column;">
         <h3>手順2: ホストに読ませる</h3>
-        <canvas id="guest-qr"></canvas>
+        <p id="guest-status" class="loading-text"></p>
+        <img id="guest-qr" class="qr-img" alt="ゲスト用QRコード">
       </div>
       <button onclick="resetSetup()" style="background-color: #757575; margin-top: 20px;">◀ 選択画面に戻る</button>
     </div>
@@ -153,22 +167,19 @@
       document.getElementById(screenId).classList.add('active');
     }
 
-    // 【追加】選択画面に戻る（リセット）機能
     function resetSetup() {
       document.getElementById('role-select').style.display = 'block';
       document.getElementById('host-ui').style.display = 'none';
       document.getElementById('guest-ui').style.display = 'none';
       document.getElementById('guest-qr-area').style.display = 'none';
       
-      // 接続中のデータを破棄
-      if (pc) {
-        pc.close();
-        pc = null;
-      }
-      if (dataChannel) {
-        dataChannel.close();
-        dataChannel = null;
-      }
+      document.getElementById('host-qr').style.display = 'none';
+      document.getElementById('guest-qr').style.display = 'none';
+      document.getElementById('host-status').className = 'loading-text';
+      document.getElementById('host-status').innerText = '';
+      
+      if (pc) { pc.close(); pc = null; }
+      if (dataChannel) { dataChannel.close(); dataChannel = null; }
     }
 
     function setupDataChannel(channel) {
@@ -187,7 +198,7 @@
       };
     }
 
-    // 【修正】QR生成が止まる問題をタイムアウト(3秒)で解決
+    // 接続情報を最速でまとめつつ、データが大きくなりすぎないようタイムアウトを短縮
     function waitForIceGathering(peerConnection) {
       return new Promise((resolve) => {
         if (peerConnection.iceGatheringState === 'complete') {
@@ -200,20 +211,41 @@
               resolve();
             }
           };
-          // 候補が見つかるたびにチェックし、null（完了）なら進む
           peerConnection.onicecandidate = (event) => {
             if (event.candidate === null) done();
           };
-          // 環境により完了合図が出ない場合があるため、3秒で強制的に次へ進める
-          setTimeout(done, 3000);
+          // 待機時間を1秒に短縮し、QRコードが複雑になりすぎるのを防止
+          setTimeout(done, 1000);
         }
       });
     }
 
-    function generateQR(canvasId, sdpObj) {
-      const jsonString = JSON.stringify(sdpObj);
-      const compressed = LZString.compressToBase64(jsonString);
-      QRCode.toCanvas(document.getElementById(canvasId), compressed, { width: 300, errorCorrectionLevel: 'L' });
+    // --- エラー訂正レベル「L（低）」を指定してドットを粗く（大きく）したQR生成 ---
+    function generateQR(imgId, sdpObj, statusElementId) {
+      const statusEl = document.getElementById(statusElementId);
+      const imgEl = document.getElementById(imgId);
+
+      try {
+        const jsonString = JSON.stringify(sdpObj);
+        const compressed = LZString.compressToBase64(jsonString);
+        
+        // ecc=L を指定してQRコードの密度を下げ、読み取りやすさを最大化
+        const qrApiUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&ecc=L&data=${encodeURIComponent(compressed)}`;
+        
+        imgEl.onload = () => {
+          statusEl.style.display = 'none';
+          imgEl.style.display = 'block';
+        };
+        imgEl.onerror = () => {
+          statusEl.className = 'error-text';
+          statusEl.innerText = "QRコードの画像読み込みに失敗しました。";
+        };
+        
+        imgEl.src = qrApiUrl;
+      } catch (err) {
+        statusEl.className = 'error-text';
+        statusEl.innerText = "データの圧縮処理でエラーが発生しました:\n" + err.message;
+      }
     }
 
     let scanCallback = null;
@@ -230,7 +262,7 @@
             try {
               const decompressed = LZString.decompressFromBase64(decodedText);
               callback(JSON.parse(decompressed));
-            } catch(e) { alert("QRコードの解析に失敗しました"); }
+            } catch(e) { alert("QRコードの解析に失敗しました。もう一度お試しください。"); }
           });
         },
         (errorMessage) => {}
@@ -247,15 +279,27 @@
       document.getElementById('role-select').style.display = 'none';
       document.getElementById('host-ui').style.display = 'flex';
       
-      pc = new RTCPeerConnection(config);
-      setupDataChannel(pc.createDataChannel('gameChannel'));
-      
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      
-      // ここで最大3秒待ってからQRを描画します
-      await waitForIceGathering(pc);
-      generateQR('host-qr', pc.localDescription);
+      const statusEl = document.getElementById('host-status');
+      statusEl.className = 'loading-text';
+      statusEl.style.display = 'block';
+      statusEl.innerText = "通信経路を準備中... (最大1秒)";
+      document.getElementById('host-qr').style.display = 'none';
+
+      try {
+        pc = new RTCPeerConnection(config);
+        setupDataChannel(pc.createDataChannel('gameChannel'));
+        
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        
+        await waitForIceGathering(pc);
+        
+        statusEl.innerText = "QRコードを生成中...";
+        generateQR('host-qr', pc.localDescription, 'host-status');
+      } catch (e) {
+        statusEl.className = 'error-text';
+        statusEl.innerText = "通信エラーが発生しました:\n" + e.message;
+      }
     }
 
     function startAsGuest() {
@@ -265,25 +309,40 @@
     }
 
     async function handleHostOffer(offerObj) {
-      pc = new RTCPeerConnection(config);
-      pc.ondatachannel = (event) => setupDataChannel(event.channel);
-      
-      await pc.setRemoteDescription(new RTCSessionDescription(offerObj));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      
-      await waitForIceGathering(pc);
-      
+      const statusEl = document.getElementById('guest-status');
+      statusEl.className = 'loading-text';
+      statusEl.style.display = 'block';
+      statusEl.innerText = "通信経路を準備中... (最大1秒)";
+      document.getElementById('guest-qr').style.display = 'none';
       document.getElementById('guest-qr-area').style.display = 'flex';
-      generateQR('guest-qr', pc.localDescription);
+
+      try {
+        pc = new RTCPeerConnection(config);
+        pc.ondatachannel = (event) => setupDataChannel(event.channel);
+        
+        await pc.setRemoteDescription(new RTCSessionDescription(offerObj));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        
+        await waitForIceGathering(pc);
+        
+        statusEl.innerText = "QRコードを生成中...";
+        generateQR('guest-qr', pc.localDescription, 'guest-status');
+      } catch (e) {
+        statusEl.className = 'error-text';
+        statusEl.innerText = "通信エラーが発生しました:\n" + e.message;
+      }
     }
 
     async function handleGuestAnswer(answerObj) {
-      await pc.setRemoteDescription(new RTCSessionDescription(answerObj));
+      try {
+        await pc.setRemoteDescription(new RTCSessionDescription(answerObj));
+      } catch (e) {
+        alert("接続の確立に失敗しました:\n" + e.message);
+      }
     }
 
-
-    // --- 以下、オセロのロジック（変更なし） ---
+    // --- 以下、オセロのロジック ---
     function getFlippableDiscs(board, index, playerNum) {
       if (board[index] !== 0) return [];
       const opponent = playerNum === 1 ? 2 : 1;
