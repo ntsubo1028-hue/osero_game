@@ -67,10 +67,9 @@
     .disc.black { opacity: 1; transform: rotateY(0deg) scale(1); }
     .disc.white { opacity: 1; transform: rotateY(180deg) scale(1); }
 
-    .loading-text { color: #ff9800; font-weight: bold; margin: 10px 0; }
+    .loading-text { color: #ff9800; font-weight: bold; margin: 5px 0; text-align: center; }
     .error-text { color: #d32f2f; font-weight: bold; margin: 10px 0; background: #ffebee; padding: 10px; border-radius: 5px; }
     
-    /* 読み取りやすいQRコード表示スタイル */
     .qr-img {
       width: 280px; height: 280px;
       border: 4px solid white; box-shadow: 0 4px 8px rgba(0,0,0,0.15);
@@ -91,23 +90,25 @@
 
     <!-- ホスト用手順UI -->
     <div id="host-ui" style="display: none; align-items: center; flex-direction: column;">
-      <h3>手順1: ゲストに読ませる</h3>
+      <h3>手順1: ゲストに読ませる (2枚)</h3>
       <p id="host-status" class="loading-text"></p>
       <img id="host-qr" class="qr-img" alt="ホスト用QRコード">
+      <button onclick="toggleQR('host-qr', 'host-status')" style="background-color: #607d8b; padding: 8px 16px; font-size: 14px;">QRコードを切り替える (1 ⇄ 2)</button>
       
-      <h3 style="margin-top: 20px;">手順2: ゲストの準備ができたら</h3>
-      <button onclick="scanQR(handleGuestAnswer)">ゲストのQRを読む</button>
+      <h3 style="margin-top: 15px;">手順2: ゲストの準備ができたら</h3>
+      <button onclick="startMultiPartScan(handleGuestAnswer)">ゲストのQRを読む (2枚)</button>
       <button onclick="resetSetup()" style="background-color: #757575;">◀ 選択画面に戻る</button>
     </div>
 
     <!-- ゲスト用手順UI -->
     <div id="guest-ui" style="display: none; align-items: center; flex-direction: column;">
-      <h3>手順1: ホストのQRを読む</h3>
-      <button onclick="scanQR(handleHostOffer)">カメラを起動する</button>
+      <h3>手順1: ホストのQRを読む (2枚)</h3>
+      <button onclick="startMultiPartScan(handleHostOffer)">カメラを起動する</button>
       <div id="guest-qr-area" style="display: none; align-items: center; flex-direction: column;">
-        <h3>手順2: ホストに読ませる</h3>
+        <h3 style="margin-top: 15px;">手順2: ホストに読ませる (2枚)</h3>
         <p id="guest-status" class="loading-text"></p>
         <img id="guest-qr" class="qr-img" alt="ゲスト用QRコード">
+        <button onclick="toggleQR('guest-qr', 'guest-status')" style="background-color: #607d8b; padding: 8px 16px; font-size: 14px;">QRコードを切り替える (1 ⇄ 2)</button>
       </div>
       <button onclick="resetSetup()" style="background-color: #757575; margin-top: 20px;">◀ 選択画面に戻る</button>
     </div>
@@ -115,7 +116,7 @@
 
   <!-- カメラ画面 -->
   <div id="camera-screen" class="screen">
-    <h3>枠内にQRコードを合わせてください</h3>
+    <h3 id="scan-guide-text">枠内にQRコードを合わせてください</h3>
     <div id="reader"></div>
     <button onclick="cancelScan()" style="background-color: #757575;">キャンセル</button>
   </div>
@@ -131,13 +132,19 @@
   </div>
 
   <script>
-    const SCAN_FRAME_RATE = 10;
+    // インターネット接続（STUNサーバー）を有効にしたままにする
     const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
     
     let pc = null;
     let dataChannel = null;
     let html5QrCode = null;
     let isHost = false;
+
+    // マルチパートQR管理用
+    let activeQRParts = [];
+    let currentQRIndex = 0;
+    let scannedParts = {};
+    let currentScanCallback = null;
 
     let gameState = {
       turnCount: 1, currentTurn: "host", board: new Array(64).fill(0), message: ""
@@ -175,9 +182,14 @@
       
       document.getElementById('host-qr').style.display = 'none';
       document.getElementById('guest-qr').style.display = 'none';
-      document.getElementById('host-status').className = 'loading-text';
       document.getElementById('host-status').innerText = '';
       
+      if (html5QrCode) {
+        html5QrCode.stop().catch(() => {}).finally(() => {
+          html5QrCode.clear();
+          html5QrCode = null;
+        });
+      }
       if (pc) { pc.close(); pc = null; }
       if (dataChannel) { dataChannel.close(); dataChannel = null; }
     }
@@ -198,19 +210,6 @@
       };
     }
 
-    // --- SDPから不要なネットワーク情報を削り、QRを極限までシンプルにする関数 ---
-    function slimSdp(sdp) {
-      const lines = sdp.split(/\r?\n/);
-      const filtered = lines.filter(line => {
-        if (line.startsWith('a=candidate')) {
-          if (line.includes('inet6')) return false; // IPv6は除外
-          if (!line.includes('typ host') && !line.includes('typ srflx')) return false; // hostとsrflx以外除外
-        }
-        return true;
-      });
-      return filtered.join('\r\n');
-    }
-
     function waitForIceGathering(peerConnection) {
       return new Promise((resolve) => {
         if (peerConnection.iceGatheringState === 'complete') {
@@ -226,60 +225,79 @@
           peerConnection.onicecandidate = (event) => {
             if (event.candidate === null) done();
           };
-          setTimeout(done, 300); // 0.3秒でコンパクトに打ち切り
+          setTimeout(done, 1000); // インターネット経由の候補をしっかり収集するため1秒待機
         }
       });
     }
 
-    function generateQR(imgId, sdpObj, statusElementId) {
-      const statusEl = document.getElementById(statusElementId);
-      const imgEl = document.getElementById(imgId);
+    // --- QRコードを2つに分割して生成する関数 ---
+    function generateMultiPartQR(imgId, statusId, sdpObj) {
+      const compactData = { t: sdpObj.type, s: sdpObj.sdp };
+      const jsonString = JSON.stringify(compactData);
+      const fullStr = LZString.compressToBase64(jsonString);
+      
+      const mid = Math.ceil(fullStr.length / 2);
+      activeQRParts = [
+        "1:" + fullStr.slice(0, mid),
+        "2:" + fullStr.slice(mid)
+      ];
+      currentQRIndex = 0;
+      renderCurrentQR(imgId, statusId);
+    }
 
-      try {
-        const compactData = { t: sdpObj.type, s: sdpObj.sdp };
-        const jsonString = JSON.stringify(compactData);
-        const compressed = LZString.compressToBase64(jsonString);
-        
-        const qrApiUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&ecc=L&data=${encodeURIComponent(compressed)}`;
-        
-        imgEl.onload = () => {
-          statusEl.style.display = 'none';
-          imgEl.style.display = 'block';
-        };
-        imgEl.onerror = () => {
-          statusEl.className = 'error-text';
-          statusEl.innerText = "QRコードの画像読み込みに失敗しました。";
-        };
-        
-        imgEl.src = qrApiUrl;
-      } catch (err) {
+    function renderCurrentQR(imgId, statusId) {
+      const statusEl = document.getElementById(statusId);
+      const imgEl = document.getElementById(imgId);
+      const data = activeQRParts[currentQRIndex];
+      const partNum = currentQRIndex + 1;
+
+      statusEl.className = 'loading-text';
+      statusEl.innerText = `QRコード生成中 (${partNum}/2)...`;
+      
+      const qrApiUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&ecc=L&data=${encodeURIComponent(data)}`;
+      
+      imgEl.onload = () => {
+        statusEl.innerText = `相手に読ませてください 【 Part ${partNum} / 2 】\n※ボタンで1枚目と2枚目を切り替えられます`;
+        imgEl.style.display = 'block';
+      };
+      imgEl.onerror = () => {
         statusEl.className = 'error-text';
-        statusEl.innerText = "データの圧縮処理でエラーが発生しました:\n" + err.message;
+        statusEl.innerText = "QRコードの画像読み込みに失敗しました。";
+      };
+      imgEl.src = qrApiUrl;
+    }
+
+    function toggleQR(imgId, statusId) {
+      if (activeQRParts.length === 2) {
+        currentQRIndex = (currentQRIndex + 1) % 2;
+        renderCurrentQR(imgId, statusId);
       }
     }
 
-    let scanCallback = null;
-    function scanQR(callback) {
-      scanCallback = callback;
+    // --- 分割されたQRコードを順番にスキャン・結合する処理 ---
+    function startMultiPartScan(callback) {
+      scannedParts = {};
+      currentScanCallback = callback;
+      runScanner();
+    }
+
+    function runScanner() {
       showScreen('camera-screen');
-      
+      const missing = !scannedParts['1'] ? '1' : '2';
+      document.getElementById('scan-guide-text').innerText = `【 Part ${missing} / 2 】のQRコードを枠内に入れてください`;
+
       if (!html5QrCode) {
         html5QrCode = new Html5Qrcode("reader");
       }
 
       html5QrCode.start(
         { facingMode: "environment" },
-        { fps: SCAN_FRAME_RATE, qrbox: { width: 250, height: 250 } },
+        { fps: 10, qrbox: { width: 260, height: 260 } },
         (decodedText) => {
           html5QrCode.stop().then(() => {
             html5QrCode.clear();
             html5QrCode = null;
-            showScreen('setup-screen');
-            try {
-              const decompressed = LZString.decompressFromBase64(decodedText);
-              const parsed = JSON.parse(decompressed);
-              callback({ type: parsed.t, sdp: parsed.s });
-            } catch(e) { alert("QRコードの解析に失敗しました。もう一度お試しください。"); }
+            processScannedData(decodedText);
           }).catch(() => {
             showScreen('setup-screen');
           });
@@ -290,7 +308,36 @@
         showScreen('setup-screen');
       });
     }
-    
+
+    function processScannedData(text) {
+      showScreen('setup-screen');
+      try {
+        if (text.startsWith("1:") || text.startsWith("2:")) {
+          const partNum = text[0];
+          const payload = text.slice(2);
+          scannedParts[partNum] = payload;
+
+          if (scannedParts['1'] && scannedParts['2']) {
+            // 両方揃ったので結合・復元
+            const fullStr = scannedParts['1'] + scannedParts['2'];
+            const decompressed = LZString.decompressFromBase64(fullStr);
+            const parsed = JSON.parse(decompressed);
+            currentScanCallback({ type: parsed.t, sdp: parsed.s });
+          } else {
+            const nextPart = scannedParts['1'] ? '2' : '1';
+            alert(`Part ${partNum}/2 の読み取り成功！\n続いて「Part ${nextPart}/2」のQRコードを読み取ってください。`);
+            setTimeout(() => {
+              runScanner(); // 自動でもう片方のスキャンへ
+            }, 300);
+          }
+        } else {
+          alert("このアプリのQRコードではありません。正しいQRコードを読み取ってください。");
+        }
+      } catch(e) {
+        alert("QRコードの解析に失敗しました。もう一度お試しください。");
+      }
+    }
+
     function cancelScan() {
       if (html5QrCode) {
         html5QrCode.stop().then(() => {
@@ -298,6 +345,8 @@
           html5QrCode = null;
           showScreen('setup-screen');
         }).catch(() => {
+          html5QrCode.clear();
+          html5QrCode = null;
           showScreen('setup-screen');
         });
       } else {
@@ -313,7 +362,7 @@
       const statusEl = document.getElementById('host-status');
       statusEl.className = 'loading-text';
       statusEl.style.display = 'block';
-      statusEl.innerText = "接続情報をスリム化して生成中...";
+      statusEl.innerText = "接続情報を収集中...";
       document.getElementById('host-qr').style.display = 'none';
 
       try {
@@ -321,12 +370,11 @@
         setupDataChannel(pc.createDataChannel('gameChannel'));
         
         const offer = await pc.createOffer();
-        offer.sdp = slimSdp(offer.sdp); // スリム化適用
         await pc.setLocalDescription(offer);
         
         await waitForIceGathering(pc);
         
-        generateQR('host-qr', pc.localDescription, 'host-status');
+        generateMultiPartQR('host-qr', 'host-status', pc.localDescription);
       } catch (e) {
         statusEl.className = 'error-text';
         statusEl.innerText = "通信エラーが発生しました:\n" + e.message;
@@ -343,7 +391,7 @@
       const statusEl = document.getElementById('guest-status');
       statusEl.className = 'loading-text';
       statusEl.style.display = 'block';
-      statusEl.innerText = "接続情報をスリム化して生成中...";
+      statusEl.innerText = "接続情報を収集中...";
       document.getElementById('guest-qr').style.display = 'none';
       document.getElementById('guest-qr-area').style.display = 'flex';
 
@@ -353,12 +401,11 @@
         
         await pc.setRemoteDescription(new RTCSessionDescription(offerObj));
         const answer = await pc.createAnswer();
-        answer.sdp = slimSdp(answer.sdp); // スリム化適用
         await pc.setLocalDescription(answer);
         
         await waitForIceGathering(pc);
         
-        generateQR('guest-qr', pc.localDescription, 'guest-status');
+        generateMultiPartQR('guest-qr', 'guest-status', pc.localDescription);
       } catch (e) {
         statusEl.className = 'error-text';
         statusEl.innerText = "通信エラーが発生しました:\n" + e.message;
