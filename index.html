@@ -70,9 +70,9 @@
     .loading-text { color: #ff9800; font-weight: bold; margin: 10px 0; }
     .error-text { color: #d32f2f; font-weight: bold; margin: 10px 0; background: #ffebee; padding: 10px; border-radius: 5px; }
     
-    /* 少し大きめのQRコード表示用スタイル */
+    /* 読み取りやすいQRコード表示スタイル */
     .qr-img {
-      width: 300px; height: 300px;
+      width: 280px; height: 280px;
       border: 4px solid white; box-shadow: 0 4px 8px rgba(0,0,0,0.15);
       background: white; margin: 10px 0; display: none;
       image-rendering: pixelated;
@@ -131,7 +131,7 @@
   </div>
 
   <script>
-    const SCAN_FRAME_RATE = 10; // 読み取り精度を高めるためフレームレートを向上
+    const SCAN_FRAME_RATE = 10;
     const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
     
     let pc = null;
@@ -198,7 +198,19 @@
       };
     }
 
-    // 接続に必要な最低限の候補を0.4秒だけ集め、データ量を最小限にする
+    // --- SDPから不要なネットワーク情報を削り、QRを極限までシンプルにする関数 ---
+    function slimSdp(sdp) {
+      const lines = sdp.split(/\r?\n/);
+      const filtered = lines.filter(line => {
+        if (line.startsWith('a=candidate')) {
+          if (line.includes('inet6')) return false; // IPv6は除外
+          if (!line.includes('typ host') && !line.includes('typ srflx')) return false; // hostとsrflx以外除外
+        }
+        return true;
+      });
+      return filtered.join('\r\n');
+    }
+
     function waitForIceGathering(peerConnection) {
       return new Promise((resolve) => {
         if (peerConnection.iceGatheringState === 'complete') {
@@ -214,18 +226,16 @@
           peerConnection.onicecandidate = (event) => {
             if (event.candidate === null) done();
           };
-          setTimeout(done, 400); // 0.4秒でコンパクトに打ち切り
+          setTimeout(done, 300); // 0.3秒でコンパクトに打ち切り
         }
       });
     }
 
-    // キー名を極限まで短縮し、LZStringで最大圧縮する関数
     function generateQR(imgId, sdpObj, statusElementId) {
       const statusEl = document.getElementById(statusElementId);
       const imgEl = document.getElementById(imgId);
 
       try {
-        // キー名を 1文字（t と s）にスリム化
         const compactData = { t: sdpObj.type, s: sdpObj.sdp };
         const jsonString = JSON.stringify(compactData);
         const compressed = LZString.compressToBase64(jsonString);
@@ -248,45 +258,51 @@
       }
     }
 
-    // カメラの精度・解像度を上げてスキャンしやすくする設定
     let scanCallback = null;
     function scanQR(callback) {
       scanCallback = callback;
       showScreen('camera-screen');
-      html5QrCode = new Html5Qrcode("reader");
       
-      const qrConfig = { fps: SCAN_FRAME_RATE, qrbox: { width: 260, height: 260 } };
-      const cameraConfig = {
-        facingMode: "environment",
-        videoConstraints: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          facingMode: "environment"
-        }
-      };
+      if (!html5QrCode) {
+        html5QrCode = new Html5Qrcode("reader");
+      }
 
       html5QrCode.start(
-        cameraConfig,
-        qrConfig,
+        { facingMode: "environment" },
+        { fps: SCAN_FRAME_RATE, qrbox: { width: 250, height: 250 } },
         (decodedText) => {
           html5QrCode.stop().then(() => {
+            html5QrCode.clear();
+            html5QrCode = null;
             showScreen('setup-screen');
             try {
               const decompressed = LZString.decompressFromBase64(decodedText);
               const parsed = JSON.parse(decompressed);
-              // 短縮したキーを元に戻す
-              const originalSdp = { type: parsed.t, sdp: parsed.s };
-              callback(originalSdp);
+              callback({ type: parsed.t, sdp: parsed.s });
             } catch(e) { alert("QRコードの解析に失敗しました。もう一度お試しください。"); }
+          }).catch(() => {
+            showScreen('setup-screen');
           });
         },
         (errorMessage) => {}
-      );
+      ).catch(err => {
+        alert("カメラの起動に失敗しました。カメラの権限やブラウザ設定をご確認ください。");
+        showScreen('setup-screen');
+      });
     }
     
     function cancelScan() {
-      if(html5QrCode) html5QrCode.stop();
-      showScreen('setup-screen');
+      if (html5QrCode) {
+        html5QrCode.stop().then(() => {
+          html5QrCode.clear();
+          html5QrCode = null;
+          showScreen('setup-screen');
+        }).catch(() => {
+          showScreen('setup-screen');
+        });
+      } else {
+        showScreen('setup-screen');
+      }
     }
 
     async function startAsHost() {
@@ -297,7 +313,7 @@
       const statusEl = document.getElementById('host-status');
       statusEl.className = 'loading-text';
       statusEl.style.display = 'block';
-      statusEl.innerText = "接続経路を準備中... (約0.4秒)";
+      statusEl.innerText = "接続情報をスリム化して生成中...";
       document.getElementById('host-qr').style.display = 'none';
 
       try {
@@ -305,11 +321,11 @@
         setupDataChannel(pc.createDataChannel('gameChannel'));
         
         const offer = await pc.createOffer();
+        offer.sdp = slimSdp(offer.sdp); // スリム化適用
         await pc.setLocalDescription(offer);
         
         await waitForIceGathering(pc);
         
-        statusEl.innerText = "QRコードを生成中...";
         generateQR('host-qr', pc.localDescription, 'host-status');
       } catch (e) {
         statusEl.className = 'error-text';
@@ -327,7 +343,7 @@
       const statusEl = document.getElementById('guest-status');
       statusEl.className = 'loading-text';
       statusEl.style.display = 'block';
-      statusEl.innerText = "接続経路を準備中... (約0.4秒)";
+      statusEl.innerText = "接続情報をスリム化して生成中...";
       document.getElementById('guest-qr').style.display = 'none';
       document.getElementById('guest-qr-area').style.display = 'flex';
 
@@ -337,11 +353,11 @@
         
         await pc.setRemoteDescription(new RTCSessionDescription(offerObj));
         const answer = await pc.createAnswer();
+        answer.sdp = slimSdp(answer.sdp); // スリム化適用
         await pc.setLocalDescription(answer);
         
         await waitForIceGathering(pc);
         
-        statusEl.innerText = "QRコードを生成中...";
         generateQR('guest-qr', pc.localDescription, 'guest-status');
       } catch (e) {
         statusEl.className = 'error-text';
