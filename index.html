@@ -70,9 +70,9 @@
     .loading-text { color: #ff9800; font-weight: bold; margin: 10px 0; }
     .error-text { color: #d32f2f; font-weight: bold; margin: 10px 0; background: #ffebee; padding: 10px; border-radius: 5px; }
     
-    /* 大きくて読み取りやすいQRコード画像スタイル */
+    /* 少し大きめのQRコード表示用スタイル */
     .qr-img {
-      width: 280px; height: 280px;
+      width: 300px; height: 300px;
       border: 4px solid white; box-shadow: 0 4px 8px rgba(0,0,0,0.15);
       background: white; margin: 10px 0; display: none;
       image-rendering: pixelated;
@@ -131,7 +131,7 @@
   </div>
 
   <script>
-    const SCAN_FRAME_RATE = 5;
+    const SCAN_FRAME_RATE = 10; // 読み取り精度を高めるためフレームレートを向上
     const config = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
     
     let pc = null;
@@ -198,15 +198,36 @@
       };
     }
 
-    // --- エラー訂正レベルLかつ最小データでQRコードを生成 ---
+    // 接続に必要な最低限の候補を0.4秒だけ集め、データ量を最小限にする
+    function waitForIceGathering(peerConnection) {
+      return new Promise((resolve) => {
+        if (peerConnection.iceGatheringState === 'complete') {
+          resolve();
+        } else {
+          let isResolved = false;
+          const done = () => {
+            if (!isResolved) {
+              isResolved = true;
+              resolve();
+            }
+          };
+          peerConnection.onicecandidate = (event) => {
+            if (event.candidate === null) done();
+          };
+          setTimeout(done, 400); // 0.4秒でコンパクトに打ち切り
+        }
+      });
+    }
+
+    // キー名を極限まで短縮し、LZStringで最大圧縮する関数
     function generateQR(imgId, sdpObj, statusElementId) {
       const statusEl = document.getElementById(statusElementId);
       const imgEl = document.getElementById(imgId);
 
       try {
-        // 確実に { type, sdp } のプレーンオブジェクトだけを抽出
-        const cleanData = { type: sdpObj.type, sdp: sdpObj.sdp };
-        const jsonString = JSON.stringify(cleanData);
+        // キー名を 1文字（t と s）にスリム化
+        const compactData = { t: sdpObj.type, s: sdpObj.sdp };
+        const jsonString = JSON.stringify(compactData);
         const compressed = LZString.compressToBase64(jsonString);
         
         const qrApiUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&ecc=L&data=${encodeURIComponent(compressed)}`;
@@ -227,20 +248,35 @@
       }
     }
 
+    // カメラの精度・解像度を上げてスキャンしやすくする設定
     let scanCallback = null;
     function scanQR(callback) {
       scanCallback = callback;
       showScreen('camera-screen');
       html5QrCode = new Html5Qrcode("reader");
+      
+      const qrConfig = { fps: SCAN_FRAME_RATE, qrbox: { width: 260, height: 260 } };
+      const cameraConfig = {
+        facingMode: "environment",
+        videoConstraints: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: "environment"
+        }
+      };
+
       html5QrCode.start(
-        { facingMode: "environment" },
-        { fps: SCAN_FRAME_RATE, qrbox: { width: 250, height: 250 } },
+        cameraConfig,
+        qrConfig,
         (decodedText) => {
           html5QrCode.stop().then(() => {
             showScreen('setup-screen');
             try {
               const decompressed = LZString.decompressFromBase64(decodedText);
-              callback(JSON.parse(decompressed));
+              const parsed = JSON.parse(decompressed);
+              // 短縮したキーを元に戻す
+              const originalSdp = { type: parsed.t, sdp: parsed.s };
+              callback(originalSdp);
             } catch(e) { alert("QRコードの解析に失敗しました。もう一度お試しください。"); }
           });
         },
@@ -261,7 +297,7 @@
       const statusEl = document.getElementById('host-status');
       statusEl.className = 'loading-text';
       statusEl.style.display = 'block';
-      statusEl.innerText = "QRコードを生成中...";
+      statusEl.innerText = "接続経路を準備中... (約0.4秒)";
       document.getElementById('host-qr').style.display = 'none';
 
       try {
@@ -271,7 +307,9 @@
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         
-        // 待機時間を完全になくし、作成されたSDPを即座にQR化
+        await waitForIceGathering(pc);
+        
+        statusEl.innerText = "QRコードを生成中...";
         generateQR('host-qr', pc.localDescription, 'host-status');
       } catch (e) {
         statusEl.className = 'error-text';
@@ -289,7 +327,7 @@
       const statusEl = document.getElementById('guest-status');
       statusEl.className = 'loading-text';
       statusEl.style.display = 'block';
-      statusEl.innerText = "QRコードを生成中...";
+      statusEl.innerText = "接続経路を準備中... (約0.4秒)";
       document.getElementById('guest-qr').style.display = 'none';
       document.getElementById('guest-qr-area').style.display = 'flex';
 
@@ -301,7 +339,9 @@
         const answer = await pc.createAnswer();
         await pc.setLocalDescription(answer);
         
-        // 待機時間を完全になくし、作成されたSDPを即座にQR化
+        await waitForIceGathering(pc);
+        
+        statusEl.innerText = "QRコードを生成中...";
         generateQR('guest-qr', pc.localDescription, 'guest-status');
       } catch (e) {
         statusEl.className = 'error-text';
@@ -311,6 +351,10 @@
 
     async function handleGuestAnswer(answerObj) {
       try {
+        if (!pc || pc.signalingState !== "have-local-offer") {
+          alert("通信セッションの状態が正しくありません。「◀ 選択画面に戻る」を押して最初からやり直してください。");
+          return;
+        }
         await pc.setRemoteDescription(new RTCSessionDescription(answerObj));
       } catch (e) {
         alert("接続の確立に失敗しました:\n" + e.message);
